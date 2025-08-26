@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AirDraw — Mirror + Live Camera</title>
+  <style>
+    :root{
+      --bg:#071021; --panel:rgba(255,255,255,.04); --muted:#9aa7bd; --accent:#00e0ff;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#051021, #071426);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;color:#e6eef7}
+    .wrap{height:100%;display:flex;flex-direction:column}
+    header{display:flex;align-items:center;gap:12px;padding:10px 14px;background:rgba(0,0,0,.25);backdrop-filter:blur(6px)}
+    header h1{font-size:16px;margin:0}
+    .controls{margin-left:auto;display:flex;gap:8px;align-items:center}
+    .btn{background:transparent;border:1px solid rgba(255,255,255,.08);padding:8px 10px;border-radius:10px;color:var(--muted);cursor:pointer}
+    .btn.primary{border-color:var(--accent);color:var(--accent)}
+
+    .stack{position:relative;flex:1;overflow:hidden;border-top:1px solid rgba(255,255,255,.03)}
+    /* video + canvases (stacked) */
+    video, canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+    video.mirrored{transform:scaleX(-1)}
+    canvas{pointer-events:none}
+
+    #cursor{position:absolute;width:18px;height:18px;border-radius:50%;border:2px solid var(--accent);transform:translate(-9px,-9px);pointer-events:none;display:none}
+
+    /* hud */
+    .hud{position:absolute;left:12px;bottom:12px;z-index:30;display:flex;flex-direction:column;gap:8px}
+    .pill{background:rgba(0,0,0,.35);padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.04);font-size:13px;color:var(--muted)}
+
+    /* small responsive tweaks */
+    @media (max-width:600px){ header h1{font-size:14px} .controls{gap:6px} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>AirDraw — Live Camera + Mirror</h1>
+      <div class="controls">
+        <label class="btn">Color <input id="color" type="color" value="#00E0FF" style="margin-left:8px"></label>
+        <label class="btn">Brush <input id="size" type="range" min="2" max="36" value="6" style="margin-left:8px"></label>
+        <label class="btn">Eraser <input id="eraser" type="range" min="20" max="140" value="64" style="margin-left:8px"></label>
+        <button id="mirrorBtn" class="btn primary">Mirror: ON (M)</button>
+        <button id="clear" class="btn">Clear (C)</button>
+        <button id="save" class="btn">Save (S)</button>
+      </div>
+    </header>
+
+    <div class="stack" id="stack">
+      <video id="video" autoplay playsinline></video>
+      <canvas id="overlay"></canvas> <!-- landmarks / helper visuals -->
+      <canvas id="draw"></canvas>    <!-- actual strokes -->
+      <div id="cursor"></div>
+
+      <div class="hud">
+        <div class="pill" id="mode">Mode: —</div>
+        <div class="pill" id="hint">Gestures: Index = draw • Index+Middle = hover • Open palm = erase</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MediaPipe -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+    // Elements
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const draw = document.getElementById('draw');
+    const octx = overlay.getContext('2d');
+    const dctx = draw.getContext('2d');
+    const cursor = document.getElementById('cursor');
+    const modeEl = document.getElementById('mode');
+
+    const colorEl = document.getElementById('color');
+    const sizeEl = document.getElementById('size');
+    const eraserEl = document.getElementById('eraser');
+    const mirrorBtn = document.getElementById('mirrorBtn');
+    const clearBtn = document.getElementById('clear');
+    const saveBtn = document.getElementById('save');
+
+    // State
+    let mirror = true; // default: mirror ON so movement feels natural
+    let smoothing = 0.75; // exponential smoothing alpha (0..0.99); higher = smoother but laggier
+    let lastSmoothed = null;      // last smoothed pointer (for smoothing)
+    let lastDrawPoint = null;     // last point while drawing
+
+    // Resize canvases to match container
+    function resizeCanvases(){
+      const rect = overlay.getBoundingClientRect();
+      // use integer px sizes
+      overlay.width = Math.round(rect.width);
+      overlay.height = Math.round(rect.height);
+      draw.width = overlay.width; draw.height = overlay.height;
+    }
+    window.addEventListener('resize', resizeCanvases);
+
+    // Basic UI actions
+    mirrorBtn.addEventListener('click', ()=>{ mirror = !mirror; updateMirrorUI(); showToast(`Mirror ${mirror? 'ON':'OFF'}`); });
+    function updateMirrorUI(){
+      mirrorBtn.textContent = `Mirror: ${mirror? 'ON':'OFF'} (M)`;
+      if(mirror) video.classList.add('mirrored'); else video.classList.remove('mirrored');
+    }
+    clearBtn.addEventListener('click', ()=>{ dctx.clearRect(0,0,draw.width,draw.height); showToast('Canvas cleared'); });
+    saveBtn.addEventListener('click', saveMergedImage);
+
+    // Hotkeys
+    window.addEventListener('keydown', (e)=>{
+      const k = e.key.toLowerCase();
+      if(k==='m') mirrorBtn.click();
+      if(k==='c') clearBtn.click();
+      if(k==='s'){ e.preventDefault(); saveBtn.click(); }
+    });
+
+    // Small toast
+    const toast = document.createElement('div'); toast.style.cssText = 'position:fixed;top:14px;right:14px;padding:8px 12px;border-radius:10px;background:rgba(0,0,0,.6);color:#e6eef7;backdrop-filter:blur(4px);z-index:60;opacity:0;transition:.25s'; document.body.appendChild(toast);
+    let toastTimer = null;
+    function showToast(msg){ toast.textContent = msg; toast.style.opacity=1; clearTimeout(toastTimer); toastTimer=setTimeout(()=>toast.style.opacity=0,1400); }
+
+    // Map normalized MediaPipe point to canvas coords and apply mirror if needed
+    function toCanvasPt(normPt){
+      const xNorm = mirror ? (1 - normPt.x) : normPt.x;
+      return { x: xNorm * overlay.width, y: normPt.y * overlay.height };
+    }
+
+    function lerp(a,b,t){ return a + (b-a)*t; }
+    function smoothPoint(prev, cur){
+      if(!prev) return cur;
+      return { x: prev.x * smoothing + cur.x * (1 - smoothing), y: prev.y * smoothing + cur.y * (1 - smoothing) };
+    }
+
+    // Drawing primitives
+    function drawLine(p,q){
+      dctx.save(); dctx.lineCap='round'; dctx.lineJoin='round'; dctx.strokeStyle = colorEl.value; dctx.lineWidth = +sizeEl.value; dctx.beginPath(); dctx.moveTo(p.x,p.y); dctx.lineTo(q.x,q.y); dctx.stroke(); dctx.restore();
+    }
+    function eraseAt(pt, r){ dctx.save(); dctx.globalCompositeOperation='destination-out'; dctx.beginPath(); dctx.arc(pt.x,pt.y,r,0,Math.PI*2); dctx.fill(); dctx.restore(); }
+
+    // Finger state detection
+    function fingersUp(landmarks, handedness='Right'){
+      // returns boolean array [thumb, index, middle, ring, pinky]
+      const tips = [4,8,12,16,20];
+      const pips = [2,6,10,14,18];
+      const up = [false,false,false,false,false];
+      // Thumb logic depends on hand orientation; we won't rely on thumb much
+      try{
+        const isRight = handedness === 'Right';
+        const thumbTipX = landmarks[4].x; const thumbIPx = landmarks[3].x; const thumbPIPx = landmarks[2].x;
+        up[0] = isRight ? (thumbTipX > thumbPIPx + 0.01) : (thumbTipX < thumbPIPx - 0.01);
+      }catch(e){ up[0] = false; }
+      for(let i=1;i<5;i++){
+        // tip above pip -> finger extended (y smaller)
+        up[i] = landmarks[tips[i]].y < landmarks[pips[i]].y - 0.02;
+      }
+      return up;
+    }
+
+    // MediaPipe: handle results
+    let lastRawTip = null;
+    function onResults(results){
+      octx.clearRect(0,0,overlay.width,overlay.height);
+
+      if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+        const lm = results.multiHandLandmarks[0];
+        const handed = results.multiHandedness?.[0]?.label || 'Right';
+        // draw skeleton lightly on overlay
+        drawConnectors(octx, lm, HAND_CONNECTIONS, {color: '#ffffff22', lineWidth:2});
+        drawLandmarks(octx, lm, {color:'#ffffff33', radius:2});
+
+        // finger detection
+        const fu = fingersUp(lm, handed);
+        const indexUp = fu[1];
+        const middleUp = fu[2];
+        const allFingers = fu[1] && fu[2] && fu[3] && fu[4];
+
+        // tip point
+        const tip = toCanvasPt(lm[8]);
+        // show cursor
+        cursor.style.left = tip.x + 'px'; cursor.style.top = tip.y + 'px'; cursor.style.display = 'block';
+
+        // smoothing
+        const sm = smoothPoint(lastSmoothed, tip);
+        lastSmoothed = sm;
+
+        if(allFingers){
+          // Erase mode
+          modeEl.textContent = 'Mode: Erase (Open palm)';
+          eraseAt(sm, +eraserEl.value);
+          lastDrawPoint = null;
+        } else if(indexUp && middleUp){
+          // Hover/move mode
+          modeEl.textContent = 'Mode: Hover (Index + Middle)';
+          lastDrawPoint = null; // stop drawing
+        } else if(indexUp && !middleUp){
+          // Draw mode
+          modeEl.textContent = 'Mode: Draw (Index)';
+          if(lastDrawPoint){ drawLine(lastDrawPoint, sm); }
+          lastDrawPoint = sm;
+        } else {
+          modeEl.textContent = 'Mode: Idle';
+          lastDrawPoint = null;
+        }
+
+      } else {
+        // no hand
+        cursor.style.display = 'none';
+        modeEl.textContent = 'Mode: No hand detected';
+        lastSmoothed = null; lastDrawPoint = null;
+      }
+    }
+
+    // MediaPipe setup
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+    hands.onResults(onResults);
+
+    // Start camera with MediaPipe Camera helper
+    let camera = null;
+    async function startCamera(){
+      try{
+        camera = new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 1280, height: 720 });
+        await camera.start();
+        // ensure canvases sized after video starts
+        setTimeout(resizeCanvases, 250);
+        showToast('Camera started — allow permission if asked');
+      }catch(err){
+        console.error(err); alert('Camera access failed. Use Live Server (localhost) and allow camera permission.');
+      }
+    }
+    startCamera();
+
+    // Save merged image (video frame + drawing)
+    function saveMergedImage(){
+      const w = draw.width, h = draw.height;
+      const merged = document.createElement('canvas'); merged.width = w; merged.height = h; const mctx = merged.getContext('2d');
+      if(mirror){
+        // draw mirrored video so final image matches what user sees
+        mctx.save(); mctx.translate(w,0); mctx.scale(-1,1); mctx.drawImage(video,0,0,w,h); mctx.restore();
+      } else {
+        mctx.drawImage(video,0,0,w,h);
+      }
+      // draw strokes on top
+      mctx.drawImage(draw,0,0);
+      const link = document.createElement('a'); link.download = 'airdraw.png'; link.href = merged.toDataURL('image/png'); link.click();
+      showToast('Saved image');
+    }
+
+    // initial UI
+    updateMirrorUI();
+
+    // Resize when video metadata loads
+    video.addEventListener('loadeddata', ()=>{ setTimeout(resizeCanvases,120); });
+    window.addEventListener('orientationchange', resizeCanvases);
+
+    // small helper to show a brief toast at start
+    setTimeout(()=>showToast('Tip: press M to toggle mirror, C clear, S save'),800);
+  </script>
+</body>
+</html>
